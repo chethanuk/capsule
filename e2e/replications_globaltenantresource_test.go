@@ -175,6 +175,11 @@ var _ = Describe("GlobalTenantResource", Label("replications", "global", "global
 		exerciseReplicationMetadataConflicts(tenantANamespaces[0], tenantBNamespaces[0], tenantBOwner)
 	})
 
+	It("adopts a Capsule target created by a racing reconcile", Label("replication-conflicts", "replication-create-race"), func() {
+		TenantNamespaceReady(tenantA, &corev1.Namespace{Name: tenantANamespaces[0]}, uint(len(tenantANamespaces)))
+		exerciseReplicationCreateRace(tenantANamespaces[0])
+	})
+
 	It("cleans up partial creation after exhausting apply conflicts", Label("replication-conflicts", "replication-conflict-review"), func() {
 		TenantNamespaceReady(tenantA, &corev1.Namespace{Name: tenantANamespaces[0]}, uint(len(tenantANamespaces)))
 		TenantNamespaceReady(tenantB, &corev1.Namespace{Name: tenantBNamespaces[0]}, uint(len(tenantBNamespaces)))

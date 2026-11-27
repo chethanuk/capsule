@@ -541,6 +541,13 @@ func (r *Processor) Apply(
 }
 
 func retryableApplyConflict(err error) bool {
+	// AlreadyExists means another reconcile created the target after our read.
+	// Retrying re-reads it, so Capsule-owned targets take the update path and
+	// foreign ones still hit the adoption check.
+	if apierrors.IsAlreadyExists(err) {
+		return true
+	}
+
 	return apierrors.IsConflict(err) && !apierrors.HasStatusCause(err, metav1.CauseTypeFieldManagerConflict)
 }
 

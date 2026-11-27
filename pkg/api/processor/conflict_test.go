@@ -364,3 +364,59 @@ func TestApplyConflictTimestampIsScopedToTargetUID(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyRetriesCreateRace(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		labels  map[string]string
+		wantErr string
+	}{
+		{name: "racing Capsule-created target is updated", labels: map[string]string{meta.CreatedByCapsuleLabel: meta.ValueControllerReplications}},
+		{name: "racing foreign target is still rejected", wantErr: "cannot be adopted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const owner = "replication/test"
+			creates := 0
+			c := fake.NewClientBuilder().WithReturnManagedFields().WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					creates++
+					if creates > 1 {
+						return fmt.Errorf("unexpected create attempt %d", creates)
+					}
+					// Another reconcile creates the target, with stale content,
+					// between our read and our create.
+					racer := policyConfigMap(obj.GetNamespace(), obj.GetName())
+					racer.SetLabels(tc.labels)
+					racer.Object["data"] = map[string]any{"key": "stale"}
+					var racerOpts []client.CreateOption
+					if tc.labels != nil {
+						racerOpts = opts // A racing reconcile writes with our field owner.
+					}
+					if err := c.Create(ctx, racer, racerOpts...); err != nil {
+						return err
+					}
+
+					return c.Create(ctx, obj, opts...)
+				},
+			}).Build()
+			obj := policyConfigMap("tenant-a", "target")
+			result, err := (&Processor{}).Apply(t.Context(), c, obj, owner, false, false, nil, nil, nil)
+			require.Equal(t, 1, creates, "the retry must take the update path, not create again")
+
+			actual := policyConfigMap("tenant-a", "target")
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(actual), actual))
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				require.Equal(t, map[string]any{"key": "stale"}, actual.Object["data"], "a foreign target must be left untouched")
+				require.NotContains(t, actual.GetLabels(), meta.CreatedByCapsuleLabel)
+
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, result.Created)
+			require.Equal(t, actual.GetUID(), result.UID)
+			require.Equal(t, map[string]any{"key": "value"}, actual.Object["data"])
+			require.Equal(t, meta.ValueControllerReplications, actual.GetLabels()[meta.CreatedByCapsuleLabel])
+		})
+	}
+}
