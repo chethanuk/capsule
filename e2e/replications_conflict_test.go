@@ -278,3 +278,58 @@ func replicationConflictClient() client.WithWatch {
 	Expect(err).NotTo(HaveOccurred())
 	return c
 }
+
+// Create the target from a second writer immediately before our create, so the
+// real API returns AlreadyExists. Capsule targets must be adopted through the
+// retry; foreign ones must still fail the adoption check untouched.
+func exerciseReplicationCreateRace(namespace string) {
+	ctx := context.Background()
+	base := replicationConflictClient()
+	conditions, err := cache.NewCELCache()
+	Expect(err).NotTo(HaveOccurred())
+	p := processor.Processor{GatherClient: base, Mapper: base.RESTMapper(), Conditions: conditions}
+	for _, foreign := range []bool{false, true} {
+		By(fmt.Sprintf("racing a target create (foreign=%t)", foreign))
+		name := "create-race-" + rand.String(6)
+		desired := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": name, "namespace": namespace},
+			"data": map[string]any{"key": "desired"},
+		}}
+		owner := meta.ResourceFieldOwner("e2e-" + name)
+		creates := 0
+		racing := interceptor.NewClient(base, interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				creates++
+				if creates == 1 {
+					racer := &corev1.ConfigMap{Name: name, Namespace: namespace, Data: map[string]string{"key": "stale"}}
+					var racerOpts []client.CreateOption
+					if !foreign {
+						// A racing reconcile writes with the same label and field owner.
+						racer.Labels = map[string]string{meta.CreatedByCapsuleLabel: meta.ValueControllerReplications}
+						racerOpts = opts
+					}
+					Expect(c.Create(ctx, racer, racerOpts...)).To(Succeed())
+				}
+				err := c.Create(ctx, obj, opts...)
+				if creates == 1 {
+					Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "expected a real AlreadyExists: %v", err)
+				}
+				return err
+			},
+		})
+		result, err := p.Apply(ctx, racing, desired, owner, false, false, nil, nil, &apiruntime.ResourceReplicationPolicy{Protect: new(false)})
+		Expect(creates).To(Equal(1), "the retry must take the update path, not create again")
+		actual := &corev1.ConfigMap{}
+		Expect(base.Get(ctx, client.ObjectKeyFromObject(desired), actual)).To(Succeed())
+		if foreign {
+			Expect(err).To(MatchError(ContainSubstring("cannot be adopted")))
+			Expect(actual.Data).To(Equal(map[string]string{"key": "stale"}))
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Created).To(BeTrue())
+			Expect(result.UID).To(Equal(actual.UID))
+			Expect(actual.Data).To(Equal(map[string]string{"key": "desired"}))
+		}
+		Expect(base.Delete(ctx, actual)).To(Succeed())
+	}
+}
